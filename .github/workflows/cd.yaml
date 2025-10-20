@@ -1,0 +1,116 @@
+name: Deployment
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  docker-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v3
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Grant execute permission for Gradle
+        run: chmod +x gradlew
+
+      - name: Build JAR
+        run: ./gradlew clean build -x test
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      # Tag image with version if this is a release tag
+      - name: Tag Docker image with version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          docker tag ghcr.io/${{ github.repository }}:${{ github.sha }} \
+          ghcr.io/${{ github.repository }}:${GITHUB_REF#refs/tags/}
+
+      - name: Deploy to GCP VM
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.GCP_VM_IP }}
+          username: ${{ secrets.GCP_VM_USER }}
+          key: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
+          script: |
+            echo "Logging into GHCR..."
+            docker login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
+
+            echo "Pulling latest image..."
+            docker pull ghcr.io/${{ github.repository }}:${{ github.sha }}
+
+            echo "Storing previous image tag (if exists)..."
+            if docker inspect pricewolves >/dev/null 2>&1; then
+              echo "PREVIOUS_IMAGE=$(docker inspect pricewolves --format='{{.Config.Image}}')" >> $GITHUB_ENV
+            fi
+
+            echo "Stopping old container (if exists)..."
+            docker stop pricewolves || true
+            docker rm pricewolves || true
+
+            echo "Starting new container with resource limits, healthcheck, env vars, and logging..."
+            docker run -d \
+              --name pricewolves \
+              --restart unless-stopped \
+              --memory="1g" \
+              --cpus="1.0" \
+              -p 8080:8080 \
+              --health-cmd="curl -f http://localhost:8080/health || exit 1" \
+              --health-interval=30s \
+              --health-timeout=10s \
+              --health-retries=3 \
+              -e APP_ENV=production \
+              -e OTHER_ENV_VAR=${{ secrets.OTHER_ENV_VAR }} \
+              --log-driver=json-file \
+              --log-opt max-size=10m \
+              --log-opt max-file=3 \
+              ghcr.io/${{ github.repository }}:${{ github.sha }}
+
+      - name: Rollback on failure
+        if: failure() && env.PREVIOUS_IMAGE != ''
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.GCP_VM_IP }}
+          username: ${{ secrets.GCP_VM_USER }}
+          key: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
+          script: |
+            echo "Rolling back to previous image..."
+            docker stop pricewolves || true
+            docker rm pricewolves || true
+            docker run -d --name pricewolves -p 8080:8080 ${{ env.PREVIOUS_IMAGE }}
